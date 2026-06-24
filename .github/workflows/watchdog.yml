@@ -1,0 +1,46 @@
+name: KP watchdog (settee-kp.ru)
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check site and reboot VPS if down
+        env:
+          AEZA_API_KEY: ${{ secrets.AEZA_API_KEY }}
+          AEZA_SERVICE_ID: ${{ secrets.AEZA_SERVICE_ID }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SITE: https://settee-kp.ru/
+        run: |
+          set +e
+          ok=0
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$SITE"); rc=$?
+            if [ "$rc" = "0" ] && [ -n "$code" ] && [ "$code" != "000" ] && [ "$code" -lt 500 ]; then
+              ok=1; echo "check $i: HTTP $code - alive"; break
+            fi
+            echo "check $i: unreachable (rc=$rc code=$code)"; sleep 25
+          done
+          [ "$ok" = "1" ] && { echo "site OK"; exit 0; }
+          echo "site down 5/5 - rebooting VPS via aeza API"
+          SID="$AEZA_SERVICE_ID"
+          if [ -z "$SID" ]; then
+            SID=$(curl -s --max-time 20 -H "X-API-Key: $AEZA_API_KEY" https://my.aeza.net/api/services \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); it=(d.get('data') or d).get('items') or []; print(it[0]['id'] if it else '')")
+          fi
+          if [ -n "$SID" ]; then
+            curl -s --max-time 25 -X POST -H "X-API-Key: $AEZA_API_KEY" -H "Content-Type: application/json" \
+              -d '{"action":"reboot"}' "https://my.aeza.net/api/services/$SID/ctl"; echo
+          else
+            echo "service id not found"
+          fi
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            curl -s --max-time 15 "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+              --data-urlencode "chat_id=$TG_CHAT" \
+              --data-urlencode "text=settee-kp.ru не отвечал — отправлена автоперезагрузка VPS (aeza). Проверьте через 1-2 мин." >/dev/null
+          fi
