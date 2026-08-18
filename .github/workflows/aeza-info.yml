@@ -1,0 +1,44 @@
+name: aeza-info
+on:
+  workflow_dispatch: {}
+jobs:
+  info:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query Aeza (safe fields only)
+        env:
+          KEY: ${{ secrets.AEZA_API_KEY }}
+        run: |
+          set +e
+          for url in \
+            "https://my.aeza.net/api/services" \
+            "https://my.aeza.net/api/services?type=vps" \
+            "https://my.aeza.net/api/vps"; do
+            echo "==== GET $url ===="
+            code=$(curl -s -o /tmp/resp.json -w '%{http_code}' --max-time 20 -H "X-API-Key: $KEY" "$url")
+            echo "HTTP $code"
+            python3 - <<'PY'
+import json
+try:
+    d=json.load(open('/tmp/resp.json'))
+except Exception as e:
+    print('non-json:', open('/tmp/resp.json').read()[:200]); raise SystemExit
+items=None
+if isinstance(d,list): items=d
+elif isinstance(d,dict):
+    dd=d.get('data')
+    if isinstance(dd,dict): items=dd.get('items')
+    if items is None: items=d.get('items')
+    if items is None and isinstance(dd,list): items=dd
+if not items:
+    print('  структура (без значений), ключи:', list(d.keys()) if isinstance(d,dict) else type(d).__name__)
+else:
+    for s in items:
+        if isinstance(s,dict):
+            prod=s.get('name') or (s.get('product') or {}).get('name') or s.get('tariff')
+            print('  SERVICE id=%s ip=%s product=%s status=%s expires=%s' % (
+                s.get('id'), s.get('ip') or s.get('ipv4') or s.get('mainIp'),
+                prod, s.get('status') or s.get('state'),
+                s.get('expiresAt') or s.get('paidTill') or s.get('expire')))
+PY
+          done
