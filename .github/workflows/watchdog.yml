@@ -57,9 +57,10 @@ jobs:
 
           # 3) состояние (де-дуп оповещений)
           today=$(date -u +%F)
-          pstatus=up; pdown=0; plast="$today"
+          pstatus=up; pdown=0; plast=""
           if [ -f state.txt ]; then read -r pstatus pdown plast < state.txt; fi
-          [ -z "$pstatus" ] && pstatus=up; [ -z "$pdown" ] && pdown=0; [ -z "$plast" ] && plast="$today"
+          [ -z "$pstatus" ] && pstatus=up; [ -z "$pdown" ] && pdown=0
+          [ -z "$plast" ] && plast="1970-01-01"   # нет файла/пусто → форсим коммит-хартбит
 
           send() {
             IFS=','
