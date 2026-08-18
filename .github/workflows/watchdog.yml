@@ -5,11 +5,20 @@ on:
     - cron: '*/5 * * * *'
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+
+concurrency:
+  group: watchdog
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - name: Check site and reboot VPS if down
+      - uses: actions/checkout@v4
+
+      - name: Check site, alert and auto-reboot if down
         env:
           AEZA_API_KEY: ${{ secrets.AEZA_API_KEY }}
           AEZA_SERVICE_ID: ${{ secrets.AEZA_SERVICE_ID }}
@@ -18,29 +27,69 @@ jobs:
           SITE: https://settee-kp.ru/
         run: |
           set +e
-          ok=0
+
+          # 1) доступность сайта — 5 попыток
+          alive=0
           for i in 1 2 3 4 5; do
             code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$SITE"); rc=$?
             if [ "$rc" = "0" ] && [ -n "$code" ] && [ "$code" != "000" ] && [ "$code" -lt 500 ]; then
-              ok=1; echo "check $i: HTTP $code - alive"; break
+              alive=1; echo "check $i: HTTP $code — alive"; break
             fi
-            echo "check $i: unreachable (rc=$rc code=$code)"; sleep 25
+            echo "check $i: unreachable (rc=$rc code=$code)"; [ "$i" -lt 5 ] && sleep 20
           done
-          [ "$ok" = "1" ] && { echo "site OK"; exit 0; }
-          echo "site down 5/5 - rebooting VPS via aeza API"
-          SID="$AEZA_SERVICE_ID"
-          if [ -z "$SID" ]; then
-            SID=$(curl -s --max-time 20 -H "X-API-Key: $AEZA_API_KEY" https://my.aeza.net/api/services \
-              | python3 -c "import sys,json; d=json.load(sys.stdin); it=(d.get('data') or d).get('items') or []; print(it[0]['id'] if it else '')")
+
+          # 2) при падении — попытка авто-перезагрузки VPS через Aeza
+          reboot_msg=""
+          if [ "$alive" != "1" ]; then
+            SID="$AEZA_SERVICE_ID"
+            if [ -z "$SID" ]; then
+              SID=$(curl -s --max-time 20 -H "X-API-Key: $AEZA_API_KEY" https://my.aeza.net/api/services \
+                | python3 -c "import sys,json; d=json.load(sys.stdin); it=(d.get('data') or {}).get('items') or d.get('items') or (d.get('data') if isinstance(d.get('data'),list) else []); print(it[0]['id'] if it else '')" 2>/dev/null)
+            fi
+            if [ -n "$SID" ]; then
+              resp=$(curl -s --max-time 25 -X POST -H "X-API-Key: $AEZA_API_KEY" -H "Content-Type: application/json" -d '{"action":"reboot"}' "https://my.aeza.net/api/services/$SID/ctl")
+              echo "aeza reboot resp: $resp"
+              reboot_msg="Отправлена автоперезагрузка VPS. Если через 3–5 мин не поднимется — зайдите в панель Aeza и запустите сервер вручную (мог быть остановлен провайдером — проверьте баланс)."
+            else
+              reboot_msg="Авто-перезагрузку выполнить НЕ удалось (не найден сервис Aeza). Зайдите в панель Aeza и запустите/перезагрузите сервер вручную, проверьте баланс."
+            fi
           fi
-          if [ -n "$SID" ]; then
-            curl -s --max-time 25 -X POST -H "X-API-Key: $AEZA_API_KEY" -H "Content-Type: application/json" \
-              -d '{"action":"reboot"}' "https://my.aeza.net/api/services/$SID/ctl"; echo
+
+          # 3) состояние (де-дуп оповещений)
+          today=$(date -u +%F)
+          pstatus=up; pdown=0; plast="$today"
+          if [ -f state.txt ]; then read -r pstatus pdown plast < state.txt; fi
+          [ -z "$pstatus" ] && pstatus=up; [ -z "$pdown" ] && pdown=0; [ -z "$plast" ] && plast="$today"
+
+          send() {
+            IFS=','
+            for c in $TG_CHAT; do
+              [ -n "$c" ] && curl -s --max-time 15 "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+                --data-urlencode "chat_id=$c" --data-urlencode "text=$1" >/dev/null
+            done
+            unset IFS
+          }
+
+          if [ "$alive" = "1" ]; then
+            nstatus=up; ndown=0
+            if [ "$pstatus" = "down" ]; then
+              send "🟢 settee-kp.ru снова работает — КП восстановлен."
+            fi
           else
-            echo "service id not found"
+            nstatus=down; ndown=$((pdown + 1))
+            # первое падение + напоминание каждый ~12-й прогон, чтобы не спамить
+            if [ "$pstatus" != "down" ] || [ $((ndown % 12)) -eq 1 ]; then
+              send "🔴 settee-kp.ru НЕ отвечает (проверка №$ndown). $reboot_msg"
+            fi
           fi
-          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
-            curl -s --max-time 15 "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
-              --data-urlencode "chat_id=$TG_CHAT" \
-              --data-urlencode "text=settee-kp.ru не отвечал — отправлена автоперезагрузка VPS (aeza). Проверьте через 1-2 мин." >/dev/null
+
+          # 4) сохраняем состояние; коммит при изменении или раз в сутки (чтобы Actions не отключились от простоя)
+          echo "$nstatus $ndown $today" > state.txt
+          if [ "$nstatus" != "$pstatus" ] || [ "$ndown" != "$pdown" ] || [ "$today" != "$plast" ]; then
+            git config user.name "kp-watchdog"
+            git config user.email "watchdog@settee.local"
+            git add state.txt
+            git commit -m "state: $nstatus down=$ndown ($today)" >/dev/null 2>&1
+            git push >/dev/null 2>&1
           fi
+          echo "done: alive=$alive status=$nstatus down=$ndown"
