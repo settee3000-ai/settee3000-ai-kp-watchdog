@@ -18,10 +18,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check site, alert and auto-reboot if down
+      - name: Check site, alert and auto-reboot (Selectel) if down
         env:
-          AEZA_API_KEY: ${{ secrets.AEZA_API_KEY }}
-          AEZA_SERVICE_ID: ${{ secrets.AEZA_SERVICE_ID }}
+          SEL_USER: ${{ secrets.SELECTEL_USERNAME }}
+          SEL_PASS: ${{ secrets.SELECTEL_PASSWORD }}
+          SEL_ACCOUNT: ${{ secrets.SELECTEL_ACCOUNT }}
+          SEL_PROJECT: ${{ secrets.SELECTEL_PROJECT }}
+          SEL_SERVER: ${{ secrets.SELECTEL_SERVER_ID }}
+          SEL_REGION: ${{ secrets.SELECTEL_REGION }}
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
           SITE: https://settee-kp.ru/
@@ -38,20 +42,22 @@ jobs:
             echo "check $i: unreachable (rc=$rc code=$code)"; [ "$i" -lt 5 ] && sleep 20
           done
 
-          # 2) при падении — попытка авто-перезагрузки VPS через Aeza
+          # 2) при падении — авто-перезагрузка сервера через Selectel OpenStack API
           reboot_msg=""
           if [ "$alive" != "1" ]; then
-            SID="$AEZA_SERVICE_ID"
-            if [ -z "$SID" ]; then
-              SID=$(curl -s --max-time 20 -H "X-API-Key: $AEZA_API_KEY" https://my.aeza.net/api/services \
-                | python3 -c "import sys,json; d=json.load(sys.stdin); it=(d.get('data') or {}).get('items') or d.get('items') or (d.get('data') if isinstance(d.get('data'),list) else []); print(it[0]['id'] if it else '')" 2>/dev/null)
-            fi
-            if [ -n "$SID" ]; then
-              resp=$(curl -s --max-time 25 -X POST -H "X-API-Key: $AEZA_API_KEY" -H "Content-Type: application/json" -d '{"action":"reboot"}' "https://my.aeza.net/api/services/$SID/ctl")
-              echo "aeza reboot resp: $resp"
-              reboot_msg="Отправлена автоперезагрузка VPS. Если через 3–5 мин не поднимется — зайдите в панель Aeza и запустите сервер вручную (мог быть остановлен провайдером — проверьте баланс)."
+            BODY=$(python3 -c "import os,json;print(json.dumps({'auth':{'identity':{'methods':['password'],'password':{'user':{'name':os.environ['SEL_USER'],'domain':{'name':os.environ['SEL_ACCOUNT']},'password':os.environ['SEL_PASS']}}},'scope':{'project':{'name':os.environ['SEL_PROJECT'],'domain':{'name':os.environ['SEL_ACCOUNT']}}}}}))")
+            curl -s -D /tmp/h.txt -o /dev/null --max-time 25 -X POST "https://cloud.api.selcloud.ru/identity/v3/auth/tokens" -H "Content-Type: application/json" -d "$BODY"
+            TOKEN=$(grep -i '^x-subject-token:' /tmp/h.txt | awk '{print $2}' | tr -d '\r\n')
+            if [ -n "$TOKEN" ]; then
+              rc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 -X POST "https://$SEL_REGION.cloud.api.selcloud.ru/compute/v2.1/servers/$SEL_SERVER/action" -H "X-Auth-Token: $TOKEN" -H "Content-Type: application/json" -d '{"reboot":{"type":"HARD"}}')
+              echo "selectel reboot http: $rc"
+              if [ "$rc" = "202" ]; then
+                reboot_msg="Отправлена автоперезагрузка сервера (Selectel) — поднимется через 1–3 мин. Если не поднялся — проверьте баланс в my.selectel.ru."
+              else
+                reboot_msg="Перезагрузка Selectel вернула код $rc. Проверьте сервер вручную в my.selectel.ru (и баланс)."
+              fi
             else
-              reboot_msg="Авто-перезагрузку выполнить НЕ удалось (не найден сервис Aeza). Зайдите в панель Aeza и запустите/перезагрузите сервер вручную, проверьте баланс."
+              reboot_msg="Не удалось авторизоваться в Selectel API. Перезагрузите сервер вручную в my.selectel.ru и проверьте баланс."
             fi
           fi
 
@@ -60,7 +66,7 @@ jobs:
           pstatus=up; pdown=0; plast=""
           if [ -f state.txt ]; then read -r pstatus pdown plast < state.txt; fi
           [ -z "$pstatus" ] && pstatus=up; [ -z "$pdown" ] && pdown=0
-          [ -z "$plast" ] && plast="1970-01-01"   # нет файла/пусто → форсим коммит-хартбит
+          [ -z "$plast" ] && plast="1970-01-01"
 
           send() {
             IFS=','
@@ -78,13 +84,12 @@ jobs:
             fi
           else
             nstatus=down; ndown=$((pdown + 1))
-            # первое падение + напоминание каждый ~12-й прогон, чтобы не спамить
             if [ "$pstatus" != "down" ] || [ $((ndown % 12)) -eq 1 ]; then
               send "🔴 settee-kp.ru НЕ отвечает (проверка №$ndown). $reboot_msg"
             fi
           fi
 
-          # 4) сохраняем состояние; коммит при изменении или раз в сутки (чтобы Actions не отключились от простоя)
+          # 4) сохранить состояние; коммит при изменении или раз в сутки (чтобы Actions не отключились)
           echo "$nstatus $ndown $today" > state.txt
           if [ "$nstatus" != "$pstatus" ] || [ "$ndown" != "$pdown" ] || [ "$today" != "$plast" ]; then
             git config user.name "kp-watchdog"
